@@ -30,132 +30,132 @@ let closing = false;
 process.title = config.ident + ': receiver/' + currentInterface;
 
 config.on('reload', () => {
-    log.info('SMTP/' + currentInterface + '/' + process.pid, '[%s] Configuration reloaded', clientId);
+  log.info('SMTP/' + currentInterface + '/' + process.pid, '[%s] Configuration reloaded', clientId);
 });
 
 let sendCommand = (cmd, callback) => {
-    let id = ++cmdId;
-    let data = {
-        req: id
+  let id = ++cmdId;
+  let data = {
+    req: id
+  };
+
+  if (typeof cmd === 'string') {
+    cmd = {
+      cmd
     };
+  }
 
-    if (typeof cmd === 'string') {
-        cmd = {
-            cmd
-        };
-    }
-
-    Object.keys(cmd).forEach(key => (data[key] = cmd[key]));
-    responseHandlers.set(id, callback);
-    queueClient.send(data);
+  Object.keys(cmd).forEach(key => (data[key] = cmd[key]));
+  responseHandlers.set(id, callback);
+  queueClient.send(data);
 };
 
 let startSMTPInterface = (key, done) => {
-    let smtp = new SMTPInterface(key, config.smtpInterfaces[key], sendCommand);
-    smtp.setup(err => {
-        if (err) {
-            log.error(smtp.logName, 'Could not start ' + key + ' MTA server');
-            log.error(smtp.logName, err);
-            return done(err);
-        }
-        log.info(smtp.logName, 'SMTP ' + key + ' MTA server started');
-        return done(null, smtp);
-    });
+  let smtp = new SMTPInterface(key, config.smtpInterfaces[key], sendCommand);
+  smtp.setup(err => {
+    if (err) {
+      log.error(smtp.logName, 'Could not start ' + key + ' MTA server');
+      log.error(smtp.logName, err);
+      return done(err);
+    }
+    log.info(smtp.logName, 'SMTP ' + key + ' MTA server started');
+    return done(null, smtp);
+  });
 };
 
 queueClient.connect(err => {
+  if (err) {
+    log.error('SMTP/' + currentInterface + '/' + process.pid, 'Could not connect to Queue server');
+    log.error('SMTP/' + currentInterface + '/' + process.pid, err.message);
+    process.exit(1);
+  }
+
+  queueClient.on('close', () => {
+    if (!closing) {
+      log.error('SMTP/' + currentInterface + '/' + process.pid, 'Connection to Queue server closed unexpectedly');
+      process.exit(1);
+    }
+  });
+
+  queueClient.on('error', err => {
+    if (!closing) {
+      log.error('SMTP/' + currentInterface + '/' + process.pid, 'Connection to Queue server ended with error %s', err.message);
+      process.exit(1);
+    }
+  });
+
+  queueClient.onData = (data, next) => {
+    let callback;
+    if (responseHandlers.has(data.req)) {
+      callback = responseHandlers.get(data.req);
+      responseHandlers.delete(data.req);
+      setImmediate(() => callback(data.error ? data.error : null, !data.error && data.response));
+    }
+    next();
+  };
+
+  // Notify the server about the details of this client
+  queueClient.send({
+    cmd: 'HELLO',
+    smtp: currentInterface,
+    id: clientId
+  });
+
+  let queue = new RemoteQueue();
+  queue.init(sendCommand, err => {
     if (err) {
-        log.error('SMTP/' + currentInterface + '/' + process.pid, 'Could not connect to Queue server');
-        log.error('SMTP/' + currentInterface + '/' + process.pid, err.message);
-        process.exit(1);
+      log.error('SMTP/' + currentInterface + '/' + process.pid, 'Queue error %s', err.message);
+      return process.exit(1);
     }
 
-    queueClient.on('close', () => {
-        if (!closing) {
-            log.error('SMTP/' + currentInterface + '/' + process.pid, 'Connection to Queue server closed unexpectedly');
-            process.exit(1);
-        }
+    plugins.handler.queue = queue;
+
+    plugins.handler.load(() => {
+      log.info('SMTP/' + currentInterface + '/' + process.pid, '%s plugins loaded', plugins.handler.loaded.length);
     });
 
-    queueClient.on('error', err => {
-        if (!closing) {
-            log.error('SMTP/' + currentInterface + '/' + process.pid, 'Connection to Queue server ended with error %s', err.message);
-            process.exit(1);
-        }
+    startSMTPInterface(currentInterface, (err, smtp) => {
+      if (err) {
+        log.error('SMTP/' + currentInterface + '/' + process.pid, 'SMTP error %s', err.message);
+        return process.exit(1);
+      }
+      smtpServer = smtp;
     });
-
-    queueClient.onData = (data, next) => {
-        let callback;
-        if (responseHandlers.has(data.req)) {
-            callback = responseHandlers.get(data.req);
-            responseHandlers.delete(data.req);
-            setImmediate(() => callback(data.error ? data.error : null, !data.error && data.response));
-        }
-        next();
-    };
-
-    // Notify the server about the details of this client
-    queueClient.send({
-        cmd: 'HELLO',
-        smtp: currentInterface,
-        id: clientId
-    });
-
-    let queue = new RemoteQueue();
-    queue.init(sendCommand, err => {
-        if (err) {
-            log.error('SMTP/' + currentInterface + '/' + process.pid, 'Queue error %s', err.message);
-            return process.exit(1);
-        }
-
-        plugins.handler.queue = queue;
-
-        plugins.handler.load(() => {
-            log.info('SMTP/' + currentInterface + '/' + process.pid, '%s plugins loaded', plugins.handler.loaded.length);
-        });
-
-        startSMTPInterface(currentInterface, (err, smtp) => {
-            if (err) {
-                log.error('SMTP/' + currentInterface + '/' + process.pid, 'SMTP error %s', err.message);
-                return process.exit(1);
-            }
-            smtpServer = smtp;
-        });
-    });
+  });
 });
 
 // start accepting sockets
 process.on('message', (m, socket) => {
-    if (m === 'socket') {
-        if (!socket) {
-            log.verbose('SMTP/' + currentInterface + '/' + process.pid, 'Null Socket');
-            return;
-        }
-
-        let passSocket = () =>
-            smtpServer.server._handleProxy(socket, (proxyErr, socketOptions) => {
-                smtpServer.server.connect(socket, socketOptions);
-            });
-
-        if (!smtpServer || !smtpServer.server) {
-            let tryCount = 0;
-            let nextTry = () => {
-                if (smtpServer && smtpServer.server) {
-                    return passSocket();
-                }
-                if (tryCount++ > 5) {
-                    try {
-                        return socket.end('421 Process not yet initialized\r\n');
-                    } catch (E) {
-                        // ignore
-                    }
-                } else {
-                    return setTimeout(nextTry, 100 * tryCount).unref();
-                }
-            };
-            return setTimeout(nextTry, 100).unref();
-        }
-
-        return passSocket();
+  if (m === 'socket') {
+    if (!socket) {
+      log.verbose('SMTP/' + currentInterface + '/' + process.pid, 'Null Socket');
+      return;
     }
+
+    let passSocket = () =>
+      smtpServer.server._handleProxy(socket, (proxyErr, socketOptions) => {
+        smtpServer.server.connect(socket, socketOptions);
+      });
+
+    if (!smtpServer || !smtpServer.server) {
+      let tryCount = 0;
+      let nextTry = () => {
+        if (smtpServer && smtpServer.server) {
+          return passSocket();
+        }
+        if (tryCount++ > 5) {
+          try {
+            return socket.end('421 Process not yet initialized\r\n');
+          } catch (E) {
+            // ignore
+          }
+        } else {
+          return setTimeout(nextTry, 100 * tryCount).unref();
+        }
+      };
+      return setTimeout(nextTry, 100).unref();
+    }
+
+    return passSocket();
+  }
 });
